@@ -13,203 +13,148 @@ import (
 )
 
 const (
-	DefaultChannelLength = 100
+	DefaultBufferSize = 100
 )
 
 var (
-	ErrInvalidBatchSize = errors.New("batch size cannot be 0 or bigger than channel length")
-	ErrInvalidConfig    = errors.New("invalid config")
+	ErrInvalidPoolSize    = errors.New("pool size must be larger than 0")
+	ErrInvalidBufferSize  = errors.New("buffer size must be larger than 0")
+	ErrInvalidBatchSize   = errors.New("batch size cannot be 0 or bigger than buffer length")
+	ErrChannelClosed      = errors.New("job channel closed")
+	ErrChannelUnavailable = errors.New("result channel unavailable")
 )
 
-// BatchPool implements goroutine worker pool that accepts batch requests
-type BatchPool struct {
-	numWorkers int                // number of worker goroutines
-	chanLen    int                // request buffered channel length
-	eg         *errgroup.Group    // errgroup used for synchronization
-	cancel     context.CancelFunc // cancel func used to gracefully shutdown worker goroutines
-	reqCh      chan BatchRequest  // request buffered channel
-
-	// respChMap is a map of response channels created by each batch request
-	// sync.Map is used here because it is optimized for this specific use case
-	// when the entry for a given key is only ever written once but read many times
-	// and multiple goroutines read entries for disjoint sets of keys
-	respChMap *sync.Map // map[string]chan BatchResponse
+// Pool implements goroutine worker pool that accepts batch jobs
+type Pool struct {
+	size    int
+	bufsize int
+	eg      *errgroup.Group
+	cancel  context.CancelFunc
+	ch      chan batchJob
+	rm      *sync.Map
 }
 
-// NewBatchPool returns a new BatchPool from given options
-func NewBatchPool(opts ...BatchPoolOption) (*BatchPool, error) {
+// NewPool returns a new BatchPool from given options
+func NewPool(opts ...PoolOption) (*Pool, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	bp := &BatchPool{
-		numWorkers: runtime.NumCPU(),
-		chanLen:    DefaultChannelLength,
-		eg:         &errgroup.Group{},
-		cancel:     cancel,
-		reqCh:      make(chan BatchRequest, DefaultChannelLength),
-		respChMap:  &sync.Map{},
+	p := &Pool{
+		size:    runtime.NumCPU(),
+		bufsize: DefaultBufferSize,
+		eg:      &errgroup.Group{},
+		cancel:  cancel,
+		rm:      &sync.Map{},
 	}
 	for _, opt := range opts {
-		opt(bp)
+		opt(p)
 	}
-	if bp.numWorkers <= 0 {
-		return nil, fmt.Errorf("%w: numWorkers must be larger than 0", ErrInvalidConfig)
+	if p.size <= 0 {
+		return nil, ErrInvalidPoolSize
 	}
-	if bp.chanLen <= 0 {
-		return nil, fmt.Errorf("%w: channel length must be larger than 0", ErrInvalidConfig)
+	if p.bufsize <= 0 {
+		return nil, ErrInvalidBufferSize
 	}
-	for i := 0; i < bp.numWorkers; i++ {
-		bp.eg.Go(func() error {
+	p.ch = make(chan batchJob, p.bufsize)
+	for i := 0; i < p.size; i++ {
+		p.eg.Go(func() error {
 			for {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case req := <-bp.reqCh:
-					resp, err := req.Process(ctx)
-					v, ok := bp.respChMap.Load(req.BatchID)
+				case job, ok := <-p.ch:
 					if !ok {
-						// drop request if it contains invalid batchID
-						log.Printf("WARN: invalid batch ID: %s", req.BatchID)
+						return ErrChannelClosed
+					}
+					v, err := job.Do(ctx)
+					ch, ok := p.rm.Load(job.bid)
+					if !ok {
+						log.Printf("WARN: dropping job with invalid bid: %s", job.bid)
 						continue
 					}
-					respCh, ok := v.(chan BatchResponse)
-					if !ok {
-						// respChMap always contains BatchResponse channel
-						return errors.New("CRTICIAL: invalid response channel type")
-					}
-					respCh <- BatchResponse{
-						Request:  req.Request,
-						Response: resp,
-						Err:      err,
-					}
+					ch.(chan Result) <- Result{Val: v, Err: err}
 				}
 			}
 		})
 	}
-	return bp, nil
+	return p, nil
 }
 
-// NumWorkers returns number of worker goroutines this pool has
-func (bp *BatchPool) NumWorkers() int {
-	return bp.numWorkers
+// Limit returns number of worker goroutines in the pool
+func (p *Pool) Size() int {
+	return p.size
 }
 
-// ChannelLength returns length of request buffered channel
-func (bp *BatchPool) ChannelLength() int {
-	return bp.chanLen
+// BufferSize returns size of job buffer
+func (p *Pool) BufferSize() int {
+	return p.bufsize
 }
 
 // Close cancels worker context and waits until all worker goroutines are terminated
 // This method is idempotent and can be called multiple times
-func (bp *BatchPool) Close() error {
-	bp.cancel()
-	return bp.eg.Wait()
+func (p *Pool) Close() error {
+	p.cancel()
+	return p.eg.Wait()
 }
 
-// Dispatch dispatches request jobs and wait until all responses are returned
-// This method does not return error if request job returns an error.
-// For request job errors, check DispatchResponse's HasError() method
-func (bp *BatchPool) Dispatch(ctx context.Context, reqs []Request) (*DispatchResponse, error) {
-	if len(reqs) > bp.chanLen {
-		return nil, ErrInvalidBatchSize
-	}
-	if len(reqs) == 0 {
+// Do dispatches batch jobs to available workers and waits until all jobs are processed
+// This method does not return an error even if one or more jobs returns an error
+func (p *Pool) Do(ctx context.Context, jobs []Job) (*BatchResult, error) {
+	if len(jobs) == 0 || len(jobs) > p.bufsize {
 		return nil, ErrInvalidBatchSize
 	}
 	uid, err := uuid.NewRandom()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate uuid: %w", err)
 	}
-	buid := uid.String()
-	if _, ok := bp.respChMap.Load(buid); ok {
-		return nil, fmt.Errorf("batch ID conflict: '%s'", buid)
+	bid := uid.String()
+	if _, ok := p.rm.Load(bid); ok {
+		return nil, fmt.Errorf("bid conflict: '%s'", bid)
 	}
-	bp.respChMap.Store(
-		buid,
-		make(chan BatchResponse, bp.chanLen),
-	)
-	for _, req := range reqs {
+	p.rm.Store(bid, make(chan Result, len(jobs)))
+	for _, job := range jobs {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case bp.reqCh <- BatchRequest{
-			BatchID: buid,
-			Request: req,
-		}:
+		case p.ch <- batchJob{Job: job, bid: bid}:
 		}
 	}
-	v, ok := bp.respChMap.Load(buid)
+	ch, ok := p.rm.Load(bid)
 	if !ok {
-		return nil, fmt.Errorf("response channel unavailable for batch ID '%s'", buid)
+		return nil, ErrChannelUnavailable
 	}
-	respCh, ok := v.(chan BatchResponse)
-	if !ok {
-		return nil, fmt.Errorf("invalid response channel type")
-	}
-	dispatchResp := &DispatchResponse{
-		BatchID:   buid,
-		Responses: make([]BatchResponse, len(reqs)),
-	}
-	for i := 0; i < len(reqs); i++ {
+	rch := ch.(chan Result)
+	res := &BatchResult{Results: make([]Result, len(jobs))}
+	for i := range jobs {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case resp := <-respCh:
-			dispatchResp.Responses[i] = resp
-			if resp.Err != nil {
-				dispatchResp.hasError = true
+		case r, ok := <-rch:
+			if !ok {
+				return nil, ErrChannelClosed
+			}
+			res.Results[i] = r
+			if r.Err != nil {
+				res.hasError = true
 			}
 		}
 	}
-	close(respCh)
-	bp.respChMap.Delete(buid)
-	return dispatchResp, nil
+	close(rch)
+	p.rm.Delete(bid)
+	return res, nil
 }
 
-// DispatchResponse is a response returned from Dispatch method
-// It contains unique request batchID generated by the pool
-// and all responses returned from processing all requests in given batch
-type DispatchResponse struct {
-	BatchID   string
-	Responses []BatchResponse
-	hasError  bool
-}
+// PoolOption represents optional configuration for BatchPool
+type PoolOption func(*Pool)
 
-// HasError returns if any of the responses has error
-func (r *DispatchResponse) HasError() bool {
-	return r.hasError
-}
-
-// BatchRequest embeds Request and unique BatchID generated by the pool
-type BatchRequest struct {
-	Request
-	BatchID string
-}
-
-// BatchResponse returns response returned from processing each request
-// It may contain error if the process returns an error
-type BatchResponse struct {
-	Request  any
-	Response any
-	Err      error
-}
-
-// Request is an interface that processes long-running work
-type Request interface {
-	Process(ctx context.Context) (any, error)
-}
-
-// BatchPoolOption represents optional configuration for BatchPool
-type BatchPoolOption func(*BatchPool)
-
-// WithNumWorkers sets number of worker goroutines for BatchPool
-func WithNumWorkers(numWorkers int) BatchPoolOption {
-	return func(bp *BatchPool) {
-		bp.numWorkers = numWorkers
+// WithSize sets number of active goroutines in a pool
+func WithSize(size int) PoolOption {
+	return func(p *Pool) {
+		p.size = size
 	}
 }
 
-// WithChannelLength sets request buffered channel length for BatchPool
-func WithChannelLength(chanLen int) BatchPoolOption {
-	return func(bp *BatchPool) {
-		bp.chanLen = chanLen
+// WithBufferSize sets buffered channel size for batch jobs
+func WithBufferSize(bufsize int) PoolOption {
+	return func(p *Pool) {
+		p.bufsize = bufsize
 	}
 }

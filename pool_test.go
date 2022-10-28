@@ -5,97 +5,96 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"runtime"
 	"sort"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/yoonsio/bpool"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	maxRequests = 100
+	maxJobs = 100
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-// TestSingleBatchRequest processes single batch request with default config
-func TestSingleBatchRequest(t *testing.T) {
+// TestBatch processes single batch request with default config
+func TestBatch(t *testing.T) {
 	type testCase struct {
-		name        string
-		numRequests int
-		numWorkers  int
-		numChanLen  int
+		name    string
+		numJobs int
+		size    int
+		bufsize int
 	}
 	testCases := []testCase{
 		{
-			name:        "single request",
-			numRequests: 1,
+			name:    "single job",
+			numJobs: 1,
 		},
 		{
-			name:        "more workers than requests",
-			numWorkers:  10,
-			numRequests: 1,
+			name:    "more workers than jobs",
+			size:    10,
+			numJobs: 1,
 		},
 		{
-			name:        "more requests than number of workers",
-			numWorkers:  1,
-			numRequests: 10,
+			name:    "more jobs than number of workers",
+			size:    1,
+			numJobs: 10,
 		},
 		{
-			name:        "channel length smaller than number of workers",
-			numWorkers:  10,
-			numChanLen:  1,
-			numRequests: 1,
+			name:    "buffer size smaller than number of workers",
+			size:    10,
+			bufsize: 1,
+			numJobs: 1,
 		},
 	}
 	for i := 0; i < 5; i++ {
-		numRequests := rand.Intn(maxRequests) + 1
+		numJobs := rand.Intn(maxJobs) + 1
 		testCases = append(testCases, testCase{
-			name:        fmt.Sprintf("%d requests", numRequests),
-			numRequests: numRequests,
+			name:    fmt.Sprintf("%d jobs", numJobs),
+			numJobs: numJobs,
 		})
 	}
-	reqs := generateTestRequests(maxRequests, 0, nil, false)
+	jobs := generateTestJobs(maxJobs, 0, nil, false)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(tt *testing.T) {
-			testReqs := reqs[:tc.numRequests]
-			opts := []bpool.BatchPoolOption{}
-			if tc.numWorkers != 0 {
-				opts = append(opts, bpool.WithNumWorkers(tc.numWorkers))
+			testJobs := jobs[:tc.numJobs]
+			opts := []bpool.PoolOption{}
+			if tc.size != 0 {
+				opts = append(opts, bpool.WithSize(tc.size))
 			}
-			if tc.numChanLen != 0 {
-				opts = append(opts, bpool.WithChannelLength(tc.numChanLen))
+			if tc.bufsize != 0 {
+				opts = append(opts, bpool.WithBufferSize(tc.bufsize))
 			}
 			ctx := context.Background()
-			bp, err := bpool.NewBatchPool(opts...)
+			bp, err := bpool.NewPool(opts...)
 			if err != nil {
-				tt.Errorf("failed to initialize batch pool: %+v", err)
+				tt.Errorf("failed to initialize pool: %+v", err)
 				return
 			}
 			defer bp.Close()
-			bresp, err := bp.Dispatch(ctx, testReqs)
+			bres, err := bp.Do(ctx, testJobs)
 			if err != nil {
-				tt.Errorf("failed to dispatch requests: %+v", err)
+				tt.Errorf("failed to process batch job: %v", err)
 				return
 			}
-			if bresp.HasError() {
+			if bres.HasError() {
 				tt.Errorf("found unexpected request processing error")
 				return
 			}
-			if len(testReqs) != len(bresp.Responses) {
-				tt.Errorf("request length '%d' is different from response length '%d'", len(testReqs), len(bresp.Responses))
+			if len(testJobs) != len(bres.Results) {
+				tt.Errorf("number of jobs '%d' is different from number of results '%d'", len(testJobs), len(bres.Results))
 				return
 			}
-			processedRequestIDs := make([]int, tc.numRequests)
-			for i, resp := range bresp.Responses {
-				processedRequestIDs[i] = resp.Response.(int)
+			processedRequestIDs := make([]int, tc.numJobs)
+			for i, resp := range bres.Results {
+				processedRequestIDs[i] = resp.Val.(int)
 			}
 			sort.Ints(processedRequestIDs)
-			for i := 0; i < tc.numRequests; i++ {
+			for i := 0; i < tc.numJobs; i++ {
 				if processedRequestIDs[i] != i {
 					tt.Errorf("unexpected response found")
 					return
@@ -105,105 +104,102 @@ func TestSingleBatchRequest(t *testing.T) {
 	}
 }
 
-// TestMultiBatchRequests processes multiple batch requests in parallel with default config
-func TestMultiBatchRequests(t *testing.T) {
+// TestBatchParallel processes multiple batch requests in parallel with default config
+func TestBatchParallel(t *testing.T) {
 	type testCase struct {
 		name       string
 		numBatches int
 	}
 	testCases := []testCase{}
 	for i := 0; i < 5; i++ {
-		numBatches := rand.Intn(10) + 1
+		numBatches := rand.Intn(10) + 2
 		testCases = append(testCases, testCase{
 			name:       fmt.Sprintf("%d batches", numBatches),
 			numBatches: numBatches,
 		})
 	}
-	reqs := generateTestRequests(maxRequests, 0, nil, false)
+	jobs := generateTestJobs(maxJobs, 0, nil, false)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(tt *testing.T) {
 			ctx := context.Background()
-			bp, err := bpool.NewBatchPool()
+			bp, err := bpool.NewPool()
 			if err != nil {
-				tt.Errorf("failed to initialize batch pool: %+v", err)
+				tt.Errorf("failed to initialize pool: %+v", err)
 				return
 			}
 			defer bp.Close()
-			wg := &sync.WaitGroup{}
-			wg.Add(tc.numBatches)
+			eg := &errgroup.Group{}
 			for i := 0; i < tc.numBatches; i++ {
-				numRequests := rand.Intn(maxRequests) + 1
-				testReqs := reqs[:numRequests]
-				go func() {
-					defer wg.Done()
-					bresp, err := bp.Dispatch(ctx, testReqs)
+				numRequests := rand.Intn(maxJobs) + 1
+				testJobs := jobs[:numRequests]
+				eg.Go(func() error {
+					bres, err := bp.Do(ctx, testJobs)
 					if err != nil {
-						tt.Errorf("failed to dispatch requests: %+v", err)
-						return
+						return fmt.Errorf("failed to dispatch requests: %w", err)
 					}
-					if bresp.HasError() {
-						tt.Errorf("found unexpected request processing error")
-						return
+					if bres.HasError() {
+						return fmt.Errorf("found unexpected request processing error")
 					}
-					if len(testReqs) != len(bresp.Responses) {
-						tt.Errorf("request length '%d' is different from response length '%d'", len(testReqs), len(bresp.Responses))
-						return
+					if len(testJobs) != len(bres.Results) {
+						return fmt.Errorf("number of jobs '%d' is different from number of results '%d'", len(testJobs), len(bres.Results))
 					}
 					processedRequestIDs := make([]int, numRequests)
-					for i, resp := range bresp.Responses {
-						processedRequestIDs[i] = resp.Response.(int)
+					for i, resp := range bres.Results {
+						processedRequestIDs[i] = resp.Val.(int)
 					}
 					sort.Ints(processedRequestIDs)
 					for i := 0; i < numRequests; i++ {
 						if processedRequestIDs[i] != i {
-							tt.Errorf("unexpected response found")
-							return
+							return fmt.Errorf("unexpected response found")
 						}
 					}
-				}()
+					return nil
+				})
 			}
-			wg.Wait()
+			if err := eg.Wait(); err != nil {
+				tt.Errorf("%+v", err)
+			}
 		})
 	}
 }
 
-// TestDispatch tests invalid dispatch usage
-func TestDispatchErrorHandling(t *testing.T) {
+// TestPoolError tests error handling for the pool
+func TestPoolError(t *testing.T) {
 	testCases := []struct {
 		name        string
-		requests    []bpool.Request
-		chanLen     int
+		jobs        []bpool.Job
+		bufsize     int
 		expectedErr error
 	}{
 		{
-			name:        "zero request size",
-			requests:    make([]bpool.Request, 0),
-			chanLen:     1,
+			name:        "zero jobs",
+			jobs:        make([]bpool.Job, 0),
+			bufsize:     1,
 			expectedErr: bpool.ErrInvalidBatchSize,
 		},
 		{
-			name:        "null request",
-			requests:    nil,
-			chanLen:     1,
+			name:        "null jobs",
+			jobs:        nil,
+			bufsize:     1,
 			expectedErr: bpool.ErrInvalidBatchSize,
 		},
 		{
-			name:        "channel length smaller than number of requests",
-			requests:    make([]bpool.Request, 5),
-			chanLen:     1,
+			name:        "buffer size smaller than number of jobs",
+			jobs:        make([]bpool.Job, 5),
+			bufsize:     1,
 			expectedErr: bpool.ErrInvalidBatchSize,
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(tt *testing.T) {
 			ctx := context.Background()
-			bp, err := bpool.NewBatchPool(bpool.WithChannelLength(tc.chanLen))
+			bp, err := bpool.NewPool(bpool.WithBufferSize(tc.bufsize))
 			if err != nil {
-				tt.Errorf("failed to initialize batch pool: %+v", err)
+				tt.Errorf("failed to initialize pool: %+v", err)
 				return
 			}
 			defer bp.Close()
-			bresp, err := bp.Dispatch(ctx, tc.requests)
+			bresp, err := bp.Do(ctx, tc.jobs)
 			if tc.expectedErr != err {
 				tt.Errorf("expected error '%v' but found '%v'", tc.expectedErr, err)
 				return
@@ -219,60 +215,60 @@ func TestDispatchErrorHandling(t *testing.T) {
 func TestConfig(t *testing.T) {
 	testCases := []struct {
 		name        string
-		numWorkers  int
-		channelLen  int
+		size        int
+		bufsize     int
 		expectedErr error
 	}{
 		{
 			name:        "default config",
-			numWorkers:  runtime.NumCPU(),
-			channelLen:  bpool.DefaultChannelLength,
+			size:        4, // using fixed value instead of runtime.NumCPU() to avoid flaky tests
+			bufsize:     bpool.DefaultBufferSize,
 			expectedErr: nil,
 		},
 		{
-			name:        "channel length smaller than numWorkers",
-			numWorkers:  4,
-			channelLen:  1,
+			name:        "buffer size smaller than pool size",
+			size:        4,
+			bufsize:     1,
 			expectedErr: nil,
 		},
 		{
-			name:        "zero numWorkers",
-			numWorkers:  0,
-			channelLen:  bpool.DefaultChannelLength,
-			expectedErr: bpool.ErrInvalidConfig,
+			name:        "zero pool size",
+			size:        0,
+			bufsize:     bpool.DefaultBufferSize,
+			expectedErr: bpool.ErrInvalidPoolSize,
 		},
 		{
-			name:        "negative numWorkers",
-			numWorkers:  -3,
-			channelLen:  bpool.DefaultChannelLength,
-			expectedErr: bpool.ErrInvalidConfig,
+			name:        "negative pool size",
+			size:        -3,
+			bufsize:     bpool.DefaultBufferSize,
+			expectedErr: bpool.ErrInvalidPoolSize,
 		},
 		{
-			name:        "zero channel length",
-			numWorkers:  1,
-			channelLen:  0,
-			expectedErr: bpool.ErrInvalidConfig,
+			name:        "zero buffer length",
+			size:        1,
+			bufsize:     0,
+			expectedErr: bpool.ErrInvalidBufferSize,
 		},
 		{
-			name:        "negative channel length",
-			numWorkers:  1,
-			channelLen:  -5,
-			expectedErr: bpool.ErrInvalidConfig,
+			name:        "negative buffer size",
+			size:        1,
+			bufsize:     -5,
+			expectedErr: bpool.ErrInvalidBufferSize,
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(tt *testing.T) {
-			bp, err := bpool.NewBatchPool(
-				bpool.WithChannelLength(tc.channelLen),
-				bpool.WithNumWorkers(tc.numWorkers),
+			bp, err := bpool.NewPool(
+				bpool.WithBufferSize(tc.bufsize),
+				bpool.WithSize(tc.size),
 			)
 			if bp != nil {
-				if bp.NumWorkers() != tc.numWorkers {
-					tt.Errorf("expected numWorkers to be '%d' but found '%d'", tc.numWorkers, bp.NumWorkers())
+				if bp.Size() != tc.size {
+					tt.Errorf("expected pool size to be '%d' but found '%d'", tc.size, bp.Size())
 					return
 				}
-				if bp.ChannelLength() != tc.channelLen {
-					tt.Errorf("expected channel length to be '%d' but found '%d'", tc.channelLen, bp.ChannelLength())
+				if bp.BufferSize() != tc.bufsize {
+					tt.Errorf("expected buffer size to be '%d' but found '%d'", tc.bufsize, bp.BufferSize())
 					return
 				}
 			}
@@ -284,8 +280,8 @@ func TestConfig(t *testing.T) {
 	}
 }
 
-// TestContextErrorHandling tests context error handling within worker pool
-func TestContextErrorHandling(t *testing.T) {
+// TestContextError tests context error handling within worker pool
+func TestContextError(t *testing.T) {
 	type testCase struct {
 		name        string
 		ctx         context.Context
@@ -317,17 +313,17 @@ func TestContextErrorHandling(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(tt *testing.T) {
-			bp, err := bpool.NewBatchPool()
+			bp, err := bpool.NewPool()
 			if err != nil {
 				tt.Errorf("failed to initialize batch pool: %v", err)
 				return
 			}
 			defer bp.Close()
-			reqs := generateTestRequests(10, 0, nil, false)
+			jobs := generateTestJobs(10, 0, nil, false)
 			if tc.cancel != nil {
 				tc.cancel()
 			}
-			if _, err := bp.Dispatch(tc.ctx, reqs); err != tc.expectedErr {
+			if _, err := bp.Do(tc.ctx, jobs); err != tc.expectedErr {
 				tt.Errorf("expected error '%v' but found '%v'", tc.expectedErr, err)
 				return
 			}
@@ -342,75 +338,75 @@ func TestContextErrorHandling(t *testing.T) {
 	}
 }
 
-// TestProcessErrorHandling tests job error handling
-func TestProcessErrorHandling(t *testing.T) {
+// TestJobError tests job error handling
+func TestJobError(t *testing.T) {
 	testCases := []struct {
 		name       string
-		processErr error
+		jobErr     error
 		partialErr bool
 	}{
 		{
 			name: "no process errors",
 		},
 		{
-			name:       "process error",
-			processErr: errors.New("test"),
+			name:   "process error",
+			jobErr: errors.New("test"),
 		},
 		{
 			name:       "partial process error",
-			processErr: errors.New("test"),
+			jobErr:     errors.New("test"),
 			partialErr: true,
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(tt *testing.T) {
-			numRequests := rand.Intn(maxRequests) + 1
-			reqs := generateTestRequests(numRequests, 0, tc.processErr, tc.partialErr)
-			testReqs := reqs[:numRequests]
-			bp, err := bpool.NewBatchPool()
+			numRequests := rand.Intn(maxJobs) + 1
+			jobs := generateTestJobs(numRequests, 0, tc.jobErr, tc.partialErr)
+			testJobs := jobs[:numRequests]
+			bp, err := bpool.NewPool()
 			if err != nil {
-				tt.Errorf("failed to initialize batch pool: %+v", err)
+				tt.Errorf("failed to initialize pool: %+v", err)
 				return
 			}
 			defer bp.Close()
 			ctx := context.Background()
-			bresp, err := bp.Dispatch(ctx, testReqs)
+			bresp, err := bp.Do(ctx, testJobs)
 			if err != nil {
 				tt.Errorf("failed to dispatch requests: %+v", err)
 				return
 			}
-			if bresp.HasError() != (tc.processErr != nil) {
-				tt.Errorf("expected batch response hasError to be '%t' but found '%t'", tc.processErr != nil, bresp.HasError())
+			if bresp.HasError() != (tc.jobErr != nil) {
+				tt.Errorf("expected batch response hasError to be '%t' but found '%t'", tc.jobErr != nil, bresp.HasError())
 				return
 			}
-			if len(testReqs) != len(bresp.Responses) {
-				tt.Errorf("request length '%d' is different from response length '%d'", len(testReqs), len(bresp.Responses))
+			if len(testJobs) != len(bresp.Results) {
+				tt.Errorf("request length '%d' is different from response length '%d'", len(testJobs), len(bresp.Results))
 				return
 			}
 			var respErr error
-			for _, resp := range bresp.Responses {
-				if !tc.partialErr && resp.Err != tc.processErr {
-					tt.Errorf("expected process error '%v' but found '%v'", tc.processErr, resp.Err)
+			for _, resp := range bresp.Results {
+				if !tc.partialErr && resp.Err != tc.jobErr {
+					tt.Errorf("expected job error '%v' but found '%v'", tc.jobErr, resp.Err)
 					return
 				}
 				if resp.Err != nil {
 					respErr = resp.Err
 				}
 			}
-			if respErr != tc.processErr {
-				tt.Errorf("expected process error '%v' but found '%v'", tc.processErr, respErr)
+			if respErr != tc.jobErr {
+				tt.Errorf("expected process error '%v' but found '%v'", tc.jobErr, respErr)
 			}
 		})
 	}
 }
 
-type mockRequest struct {
+type mockJob struct {
 	ID    int
 	Err   error
 	Delay time.Duration
 }
 
-func (r mockRequest) Process(ctx context.Context) (any, error) {
+func (r mockJob) Do(ctx context.Context) (any, error) {
 	select {
 	case <-ctx.Done():
 		return r.ID, ctx.Err()
@@ -419,27 +415,27 @@ func (r mockRequest) Process(ctx context.Context) (any, error) {
 	}
 }
 
-func generateTestRequests(
+func generateTestJobs(
 	n int,
 	delay time.Duration,
 	err error,
 	partialErr bool,
-) []bpool.Request {
-	reqs := make([]bpool.Request, n)
+) []bpool.Job {
+	jobs := make([]bpool.Job, n)
 	for i := 0; i < n; i++ {
-		processErr := err
+		jobErr := err
 		if partialErr && i%2 == 0 {
-			processErr = nil
+			jobErr = nil
 		}
 		reqDelay := delay
 		if delay == 0 {
 			reqDelay = time.Duration(rand.Intn(100)+10) * time.Millisecond
 		}
-		reqs[i] = mockRequest{
+		jobs[i] = mockJob{
 			ID:    i,
-			Err:   processErr,
+			Err:   jobErr,
 			Delay: reqDelay,
 		}
 	}
-	return reqs
+	return jobs
 }

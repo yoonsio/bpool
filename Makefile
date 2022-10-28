@@ -1,2 +1,2 @@
 test:
-	go test -race -v .
+	go test -race -v -count=1 .
